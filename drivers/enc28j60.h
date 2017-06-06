@@ -431,4 +431,7 @@ uint32_t enc28j60CalcCrc(const void *data, size_t length);
 void enc28j60DumpReg(NetInterface *interface);
 void enc28j60DumpPhyReg(NetInterface *interface);
 
+void DMA2_Stream0_IRQHandler(void);
+void DMA2_Stream5_IRQHandler(void);
+
 #endif

@@ -33,8 +33,22 @@
 #include <limits.h>
 #include "core/net.h"
 #include "drivers/enc28j60.h"
+#include "spi_driver.h"
 #include "debug.h"
+#include "stm32f2xx_hal_rcc.h"
+#ifdef SPI_USE_DMA
+#include "stm32f2xx_hal_dma.h"
+#include "stm32f2xx_hal_spi.h"
 
+static OsEvent spiSemaphore;
+#endif
+
+#ifdef SPI_USE_DMA
+
+#define DMA_RX
+#define DMA_TX
+
+#endif
 
 /**
  * @brief ENC28J60 driver
@@ -60,6 +74,14 @@ const NicDriver enc28j60Driver =
    FALSE
 };
 
+static void Delay_ms(uint32_t ms)
+{
+	//	HAL_Delay(ms);
+	volatile uint32_t nCount, RCC_Clocks;
+	RCC_Clocks= HAL_RCC_GetHCLKFreq();
+	nCount=(RCC_Clocks/1000)*ms;
+	for (; nCount!=0; nCount--);
+}
 
 /**
  * @brief ENC28J60 controller initialization
@@ -71,7 +93,13 @@ error_t enc28j60Init(NetInterface *interface)
 {
    uint8_t revisionId;
    Enc28j60Context *context;
-
+#ifdef SPI_USE_DMA
+	if(!osCreateEvent(&spiSemaphore))
+	{
+		//Failed to create semaphore
+		return ERROR_OUT_OF_RESOURCES;
+	}
+#endif
    //Debug message
    TRACE_INFO("Initializing ENC28J60 Ethernet controller...\r\n");
 
@@ -85,7 +113,7 @@ error_t enc28j60Init(NetInterface *interface)
 
    //After issuing the reset command, wait at least 1ms in firmware
    //for the device to be ready
-   sleep(10);
+	Delay_ms(2);
 
    //Point to the driver context
    context = (Enc28j60Context *) interface->nicContext;
@@ -333,6 +361,7 @@ void enc28j60EventHandler(NetInterface *interface)
    error_t error;
    uint16_t status;
    uint16_t value;
+	size_t length;
 
    //Read interrupt status register
    status = enc28j60ReadReg(interface, ENC28J60_REG_EIR);
@@ -751,7 +780,10 @@ void enc28j60WritePhyReg(NetInterface *interface, uint16_t address, uint16_t dat
    enc28j60WriteReg(interface, ENC28J60_REG_MIWRH, MSB(data));
 
    //Wait until the PHY register has been written
-   while(enc28j60ReadReg(interface, ENC28J60_REG_MISTAT) & MISTAT_BUSY);
+	while(enc28j60ReadReg(interface, ENC28J60_REG_MISTAT) & MISTAT_BUSY)
+	{
+		taskYIELD();
+	}
 }
 
 
@@ -772,7 +804,10 @@ uint16_t enc28j60ReadPhyReg(NetInterface *interface, uint16_t address)
    //Start read operation
    enc28j60WriteReg(interface, ENC28J60_REG_MICMD, MICMD_MIIRD);
    //Wait for the read operation to complete
-   while(enc28j60ReadReg(interface, ENC28J60_REG_MISTAT) & MISTAT_BUSY);
+	while(enc28j60ReadReg(interface, ENC28J60_REG_MISTAT) & MISTAT_BUSY)
+	{
+		taskYIELD();
+	}
    //Clear command register
    enc28j60WriteReg(interface, ENC28J60_REG_MICMD, 0);
 
@@ -797,10 +832,18 @@ void enc28j60WriteBuffer(NetInterface *interface,
    const NetBuffer *buffer, size_t offset)
 {
    uint_t i;
+#ifndef DMA_TX
    size_t j;
+#endif //DMA_TX
    size_t n;
    uint8_t *p;
 
+#ifdef DMA_TX
+	extern SPI_HandleTypeDef hspi1;
+
+	osResetEvent(&spiSemaphore);
+	interface->spiDriver->setMode(spiModeDmaTx);
+#endif
    //Pull the CS pin low
    interface->spiDriver->assertCs();
 
@@ -819,11 +862,19 @@ void enc28j60WriteBuffer(NetInterface *interface,
          p = (uint8_t *) buffer->chunk[i].address + offset;
          //Compute the number of bytes to copy at a time
          n = buffer->chunk[i].length - offset;
-
+#ifndef DMA_TX
          //Copy data to SRAM buffer
          for(j = 0; j < n; j++)
             interface->spiDriver->transfer(p[j]);
-
+#endif
+#ifdef DMA_TX
+			HAL_SPI_Transmit_DMA(&hspi1,(uint8_t *)p, n);
+			osWaitForEvent(&spiSemaphore, INFINITE_DELAY);
+			while (HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY)
+			{
+				taskYIELD();
+			}
+#endif
          //Process the next block from the start
          offset = 0;
       }
@@ -849,18 +900,36 @@ void enc28j60WriteBuffer(NetInterface *interface,
 void enc28j60ReadBuffer(NetInterface *interface,
    uint8_t *data, size_t length)
 {
+#ifndef DMA_RX
    size_t i;
+#else  // DMA_RX
+	extern SPI_HandleTypeDef hspi1;
+	uint8_t tmpx = 0xff;
 
+	osResetEvent(&spiSemaphore);
+
+	interface->spiDriver->setMode(spiModeDmaRx);
+#endif
    //Pull the CS pin low
    interface->spiDriver->assertCs();
 
    //Write opcode
    interface->spiDriver->transfer(ENC28J60_CMD_RBM);
 
+#ifndef DMA_RX
    //Copy data from SRAM buffer
    for(i = 0; i < length; i++)
       data[i] = interface->spiDriver->transfer(0x00);
+#endif
+#ifdef DMA_RX
+	HAL_SPI_TransmitReceive_DMA(&hspi1, &tmpx, data, (uint16_t)length);
 
+	osWaitForEvent(&spiSemaphore, INFINITE_DELAY);
+	while (HAL_SPI_GetState(&hspi1) != HAL_SPI_STATE_READY)
+	{
+		taskYIELD();
+	}
+#endif
    //Terminate the operation by raising the CS pin
    interface->spiDriver->deassertCs();
 }
@@ -1016,3 +1085,30 @@ void enc28j60DumpPhyReg(NetInterface *interface)
    TRACE_DEBUG("\r\n");
 #endif
 }
+#ifdef SPI_USE_DMA
+/*
+ * По окончанию передачи можно использовать callback функции
+ * HAL_SPI_TxCpltCallback
+ *
+ */
+void DMA2_Stream0_IRQHandler(void)
+{
+	portBASE_TYPE flag;
+	HAL_DMA_IRQHandler(hspi1.hdmarx);
+	flag=osSetEventFromIsr(&spiSemaphore);
+	osExitIsr(flag);
+}
+
+/**
+ * @brief  This function handles DMA Tx interrupt request.
+ * @param  None
+ * @retval None
+ */
+void DMA2_Stream5_IRQHandler(void)
+{
+	portBASE_TYPE flag;
+	HAL_DMA_IRQHandler(hspi1.hdmatx);
+	flag=osSetEventFromIsr(&spiSemaphore);
+	osExitIsr(flag);
+}
+#endif
